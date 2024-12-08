@@ -1,0 +1,29 @@
+FROM golang:1.21.5-alpine3.19
+
+COPY expired_fileservice_certs.txt .
+RUN apk add build-base;
+RUN apk add --upgrade zlib;
+RUN apk add --update curl;
+## Another way -> apk add ca-certificates=20240226-r0 --repository=https://dl-cdn.al
+## pinelinux.org/alpine/edge/main
+RUN for cert in `cat expired_fileservice_certs.txt`; do grep -n $cert /etc/ca-certificates.conf \
+    | cut -d ":" -f 1 | xargs -I {} sed -i "{}d" /etc/ca-certificates.conf && \
+    rm /usr/share/ca-certificates/mozilla/$cert; done
+### They are removed in upcomming versions
+RUN apk add --upgrade ca-certificates && rm -rf /var/cache/apk/* && \
+        apk update && update-ca-certificates
+RUN apk cache clean && rm -rf /var/cache/apk/* && \
+    rm -rf /etc/apk/cache/*
+
+ARG MATRIX_USER='matrixadm'
+RUN  addgroup -S $MATRIX_USER && adduser -S $MATRIX_USER -G $MATRIX_USER -u 1000
+
+COPY --chown=${MATRIX_USER}:${MATRIX_USER} ./fileservice /fileservice
+EXPOSE 8004
+EXPOSE 8005
+USER ${MATRIX_USER}
+RUN chmod +x /fileservice/run_server.sh
+
+RUN cd /fileservice  && go install fileservice
+
+CMD [ "sh", "-c", "sh /fileservice/run_server.sh" ]

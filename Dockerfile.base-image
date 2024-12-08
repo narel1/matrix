@@ -1,0 +1,91 @@
+FROM python:3.11.7-slim-bookworm AS base
+ARG CONTAINER_USER=matrixadm
+ARG CONTAINER_UID=22123
+ARG mode=prod
+COPY expired_base_certs.txt .
+RUN groupadd --gid $CONTAINER_UID $CONTAINER_USER && \
+    useradd --uid $CONTAINER_UID --create-home --home-dir /home/$CONTAINER_USER -g $CONTAINER_USER $CONTAINER_USER && \
+    apt-get update -y && \
+    apt-get install -y libpq-dev gcc g++ build-essential pkg-config libxml2-dev libxmlsec1-dev libxmlsec1-openssl \
+                               vim nmap wget libxslt-dev && \
+        apt-get install -y zlib1g-dev  cmake libfreetype6-dev libfontconfig1-dev xclip fontconfig xfonts-75dpi && \
+    for cert in `cat expired_base_certs.txt`;do grep -n $cert /etc/ca-certificates.conf | cut -d ":" -f 1 | xargs -I {} sed -i '{}s/^/!/' /etc/ca-certificates.conf; done; \
+    for cert in `cat expired_base_certs.txt`;do rm -f /usr/share/ca-certificates/mozilla/$cert; done; \
+    update-ca-certificates; \
+    apt-get install -y wget xvfb libfontconfig1 libxrender1 libldap2-dev libsasl2-dev && \
+    mkdir /matrix4 /matrix4/support /matrix4/log /matrix4/static_root /matrix4/ssl /matrix4/data /matrix4/data/reports && \
+    ln -s /matrix4 /matrixnis && \
+    apt-get clean && \
+    chown -R $CONTAINER_USER:$CONTAINER_USER /matrix4
+# Use shell logic to determine which mode to install
+RUN if [ "$mode" = "dev" ]; then \
+        apt-get install -y curl; \
+    fi
+
+USER $CONTAINER_USER
+
+FROM base as basepython
+ARG CONTAINER_USER=matrixadm
+USER root
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER dependencies/wkhtmltox_0.12.7-0.20230411.31.dev.024b2b2.bookworm_amd64.deb /tmp/var/wkhtmltox.deb
+
+RUN dpkg -i /tmp/var/wkhtmltox.deb && apt-get install -f -y && \
+rm -rf /tmp/var/wkhtmltox.deb
+
+USER $CONTAINER_USER
+
+RUN mkdir /tmp/python-libs
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER dependencies/*.whl /tmp/python-libs/
+
+WORKDIR /tmp/python-libs
+
+RUN pip install * && rm -rf /tmp/python-libs/*
+
+FROM ubuntu:20.04 as uibuild
+# User root commands
+RUN apt-get update -y;apt-get install curl -y
+COPY ngApp/ /root/ngApp/
+WORKDIR /root/ngApp/
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash && \
+export NVM_DIR="$HOME/.nvm" && \
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  && \
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" && \
+nvm install v16.20.0 && \
+npm install -g yarn && \
+yarn install && \
+./node_modules/.bin/ng build --output-path=/matrix4/app/static/dist --deploy-url=static/dist/ && \
+rm -rf node_modules  && \
+rm -rf ~/.cache ~/.nvm ~/.npm /matrix4/ngApp
+
+
+FROM basepython
+ARG CONTAINER_USER=matrixadm
+ARG MATRIX_COMMIT=unspecified
+LABEL image.matrix.commit=$MATRIX_COMMIT
+
+WORKDIR /matrix4
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER app/ ./app/
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER bin/ ./bin/
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER deployment/docker/requirements/requirements.txt .
+#dist folder is expected to be built by buildMatri4UI.sh
+COPY --chown=$CONTAINER_USER:$CONTAINER_USER gitInfo.conf ./support/
+COPY --from=uibuild --chown=$CONTAINER_USER:$CONTAINER_USER /matrix4/app/static/dist ./app/static/dist
+RUN if [ "$mode" = "dev" ]; then \
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash && \
+        export NVM_DIR="$HOME/.nvm" && \
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  && \
+        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" && \
+        nvm install v16.20.0 && \
+        npm install -g yarn && \
+        yarn install ;\
+    fi
+RUN cp -r ./app/static/dist ./static_root/
+ENV PATH=/home/$CONTAINER_USER/.local/bin:$PATH
+RUN PYTHONPATH=/usr/lib/python3/dist-packages/:$PYTHONPATH && \
+    pip install --user --upgrade pip && \
+    pip install --user -r ./requirements.txt && \
+    pip install uvicorn && \
+    pip cache purge && rm -rf /home/$CONTAINER_USER/.cache/*
+
+RUN PATH=/home/$CONTAINER_USER/.local/bin:$PATH && \
+    python app/mib/pysnmp_conversion.py
